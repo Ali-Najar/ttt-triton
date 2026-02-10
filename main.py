@@ -22,7 +22,7 @@ def train():
     torch.backends.cuda.matmul.allow_tf32 = True
 
     # Dataset paths
-    root_path = "/path/to/ETT"         # <- folder containing ETTh1.csv
+    root_path = "ETT"         # <- folder containing ETTh1.csv
     data_path = "ETTh1.csv"
 
     # Build dataset + loader
