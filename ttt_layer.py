@@ -8,7 +8,7 @@ from torch.distributed.tensor import distribute_tensor
 from forecast import SequenceMetadata, full_tensor, place_into, shard_tensor, to_local
 from forecast import ModelConfig
 from linear_triton import TritonLinear
-from mlp_tk import TkMLP
+# from mlp_tk import TkMLP
 from ops import ttt_linear, ttt_mlp
 from utils import apply_rotary_emb, precompute_freqs_cis_3d
 
@@ -427,7 +427,7 @@ class TTTMLP(TTTBase):
         self.W2 = nn.Parameter(distribute_tensor(self.W2, tp_mesh, [Shard(0)]))
         self.b2 = nn.Parameter(distribute_tensor(self.b2, tp_mesh, [Shard(0)]))
 
-        TkMLP.sharded_mode = True
+        # TkMLP.sharded_mode = True
 
     def ttt(self, inputs):
         B = inputs["XV"].shape[0]
@@ -441,7 +441,8 @@ class TTTMLP(TTTBase):
 
         checkpoint_group_size = min(max(self.config.scan_checkpoint_group_size, 1), num_mini_batch)
 
-        if self.use_kernel:
+        # if self.use_kernel:
+        if False:
             XQW_batch = TkMLP.apply(
                 self.ttt_norm_weight,
                 self.ttt_norm_bias,
