@@ -2,8 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 
-from ttt.models.ssm.ops.utils import gelu_bwd, ln_fused_l2_bwd, ln_fwd
-from ttt.models.ssm.utils import scan
+from ops.ttt_utils import gelu_bwd, ln_fused_l2_bwd, ln_fwd
+from utils import scan
 
 
 @torch.compile

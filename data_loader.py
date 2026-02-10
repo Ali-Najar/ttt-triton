@@ -2,9 +2,9 @@ import os
 import pandas as pd
 from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
-from utils.timefeatures import time_features
+from util.timefeatures import time_features
 import warnings
-from utils.augmentation import run_augmentation_single
+from util.augmentation import run_augmentation_single
 
 warnings.filterwarnings('ignore')
 
