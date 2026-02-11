@@ -66,20 +66,29 @@ import torch.nn.functional as F
 # use the real type from your repo if available
 from ttt_layer import TTTWrapper  # wherever your class lives
 
+import torch
+import torch.nn as nn
+from forecast import SequenceMetadata
+from ttt_layer import TTTWrapper
+
 class TTTForecaster(nn.Module):
-    def __init__(self, config, d_in, pred_len):
+    def __init__(self, config, d_in, d_out, pred_len):
         super().__init__()
         self.pred_len = pred_len
+        self.d_out = d_out
+
         self.in_proj = nn.Linear(d_in, config.model_dim)
         self.ttt = TTTWrapper(config)
         self.ttt.init_freqs()
-        self.head = nn.Linear(config.model_dim, pred_len)
+
+        # output pred_len * d_out, then reshape
+        self.head = nn.Linear(config.model_dim, pred_len * d_out)
+
         self.meta = SequenceMetadata(seq_text_length=0, is_multiscene=False)
-        
 
     def forward(self, seq_x):
         # seq_x: (B, L, d_in)
-        h = self.in_proj(seq_x)
-        h = self.ttt(h, self.meta)      # (B, L, model_dim)
-        yhat = self.head(h[:, -1]) # (B, pred_len)
-        return yhat
+        h = self.in_proj(seq_x)          # (B, L, model_dim)
+        h = self.ttt(h, self.meta)       # (B, L, model_dim)
+        out = self.head(h[:, -1])        # (B, pred_len*d_out)
+        return out.view(seq_x.size(0), self.pred_len, self.d_out)

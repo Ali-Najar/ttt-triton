@@ -1,113 +1,111 @@
-# train_ttt_forecaster.py
-# Assumes you already have:
-# - Dataset_ETT_hour (your dataloader class)
-# - TTTForecaster, ModelConfig (from your forecast.py)
-# - ETTh1.csv downloaded
-
-import os
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from types import SimpleNamespace
 
-from forecast import ModelConfig, TTTForecaster
-from data_loader import Dataset_ETT_hour  # <- change to your file name
+from data_factory import data_provider
+from forecast import ModelConfig
+from forecast import TTTForecaster
 
-# ---------- minimal args stub for your dataset ----------
-class Args:
-    augmentation_ratio = 0  # dataset checks this
-
-# ---------- training loop ----------
-def train():
+def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Dataset paths
-    root_path = "ETT"         # <- folder containing ETTh1.csv
-    data_path = "ETTh1.csv"
-
-    # Build dataset + loader
-    args = Args()
-    train_set = Dataset_ETT_hour(
-        args=args,
-        root_path=root_path,
-        flag="train",
-        features="S",          # 'S' => single target, easiest sanity
-        data_path=data_path,
+    # ---- args like your other repo expects ----
+    args = SimpleNamespace(
+        # dataset
+        task_name="short_term_forecast",
+        data="ETTh1",
+        root_path="ETT",      # folder containing ETTh1.csv
+        data_path="ETTh1.csv",
+        features="S",                  # "S", "M", or "MS"
         target="OT",
-        scale=True,
-        timeenc=0,
         freq="h",
-    )
-    batch_size = 32
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=2,
-        pin_memory=True,
+        embed="timeF",                 # controls timeenc in data_provider
+        seasonal_patterns=None,
+
+        # lengths
+        seq_len=384,
+        label_len=96,
+        pred_len=96,
+
+        # loader
+        batch_size=32,
+        num_workers=0,
+
+        # your Dataset_ETT_hour checks this
+        augmentation_ratio=0,
     )
 
-    # Config (must match dataset seq_len)
-    seq_len = train_set.seq_len
-    pred_len = train_set.pred_len
+    train_set, train_loader = data_provider(args, "train")
+    val_set, val_loader = data_provider(args, "val")
+
+    # Peek one batch to infer dims safely
+    batch_x, batch_y, batch_x_mark, batch_y_mark = next(iter(train_loader))
+    d_in = batch_x.shape[-1]  # number of input features/channels
+
+    # Same convention as your other code:
+    # MS => multivariate input, single target output (last dim)
+    f_dim = -1 if args.features == "MS" else 0
+    d_out = 1 if args.features == "MS" else batch_y.shape[-1]
+
+    # ---- config for TTT ----
     cfg = ModelConfig(
-        seq_len=seq_len,
+        seq_len=args.seq_len,
         model_dim=128,
         num_heads=4,
         num_layers=1,
-        ssm_layer="ttt_linear",
-        mini_batch_size=64,            # must divide seq_len (384 ok)
-        ttt_base_lr=0.05,              # slightly safer than 0.1
+        ssm_layer="ttt_linear",        # or "ttt_mlp"
+        mini_batch_size=64,            # must divide seq_len
+        ttt_base_lr=0.05,
         scan_checkpoint_group_size=16,
         latent_height=1,
         latent_width=1,
-        compressed_num_frames=None,    # will become seq_len in __post_init__
+        compressed_num_frames=None,    # becomes seq_len in __post_init__
     )
 
-    # Model
-    d_in = 1  # because features='S'
-    model = TTTForecaster(cfg, d_in=d_in, pred_len=pred_len).to(device)
+    model = TTTForecaster(cfg, d_in=d_in, d_out=d_out, pred_len=args.pred_len).to(device)
 
-    # Mixed precision (optional)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+
     use_amp = (device == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    # Optimizer
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+    def run_epoch(loader, train: bool):
+        model.train(train)
+        total = 0.0
+        n = 0
+        for batch_x, batch_y, _, _ in loader:
+            batch_x = batch_x.float().to(device, non_blocking=True)
+            batch_y = batch_y.float().to(device, non_blocking=True)
 
-    model.train()
-    global_step = 0
-    for epoch in range(3):
-        for batch in train_loader:
-            seq_x, seq_y, seq_x_mark, seq_y_mark = batch
+            # target slice EXACTLY like your other code
+            y_true = batch_y[:, -args.pred_len:, f_dim:]  # (B, pred_len, d_out)
 
-            # seq_x: (B, seq_len, 1)
-            # seq_y: (B, label_len + pred_len, 1)
-            seq_x = seq_x.to(device, non_blocking=True).float()
-            seq_y = seq_y.to(device, non_blocking=True).float()
-
-            # Predict the next pred_len points (target is last pred_len of seq_y)
-            y_true = seq_y[:, -pred_len:, 0]  # (B, pred_len)
-
-            opt.zero_grad(set_to_none=True)
+            if train:
+                opt.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=use_amp):
-                y_pred = model(seq_x)         # (B, pred_len)
+                y_pred = model(batch_x)                  # (B, pred_len, d_out)
                 loss = F.mse_loss(y_pred, y_true)
 
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            if train:
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
 
-            if global_step % 50 == 0:
-                print(f"epoch={epoch} step={global_step} loss={loss.item():.6f}")
+            total += loss.item() * batch_x.size(0)
+            n += batch_x.size(0)
 
-            global_step += 1
+        return total / max(n, 1)
 
-        # quick save
-        torch.save({"model": model.state_dict(), "cfg": cfg}, f"ttt_forecaster_epoch{epoch}.pt")
+    for epoch in range(5):
+        train_loss = run_epoch(train_loader, train=True)
+        val_loss = run_epoch(val_loader, train=False)
+        print(f"epoch {epoch:02d} | train {train_loss:.6f} | val {val_loss:.6f}")
+
+    torch.save(model.state_dict(), "ttt_forecaster.pt")
+    print("saved ttt_forecaster.pt")
 
 if __name__ == "__main__":
-    train()
+    main()
