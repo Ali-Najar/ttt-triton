@@ -24,10 +24,14 @@ class TTTWrapper(nn.Module):
         self.latent_width = config.latent_width
         self.compressed_num_frames = config.compressed_num_frames
 
+        if config.use_kernel:
+            print("Using Kernel Code")
+        else:
+            print("Using the Standard Version")
         if config.ssm_layer == "ttt_linear":
-            self.ttt = TTTLinear(config)
+            self.ttt = TTTLinear(config, use_kernel=config.use_kernel)
         elif config.ssm_layer == "ttt_mlp":
-            self.ttt = TTTMLP(config)
+            self.ttt = TTTMLP(config, use_kernel=config.use_kernel)
         else:
             raise TypeError(f"No ttt layer of type {config.ssm_layer}")
 

@@ -35,6 +35,8 @@ class ModelConfig:
     num_heads: int = 4
     num_layers: int = 1
 
+    use_kernel: bool = True
+
     ssm_layer: str = "ttt_linear"
     layer_norm_eps: float = 1e-6
 
