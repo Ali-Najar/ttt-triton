@@ -8,6 +8,7 @@ from torch.distributed.tensor import distribute_tensor
 from forecast import SequenceMetadata, full_tensor, place_into, shard_tensor, to_local
 from forecast import ModelConfig
 from linear_triton import TritonLinear
+from mlp_triton import TritonMLP
 # from mlp_tk import TkMLP
 from ops import ttt_linear, ttt_mlp
 from utils import apply_rotary_emb, precompute_freqs_cis_3d
@@ -408,9 +409,9 @@ class TTTLinear(TTTBase):
 class TTTMLP(TTTBase):
     def __init__(self, config: ModelConfig, use_kernel: bool = True):
         super().__init__(config)
-        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
-        self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, 4 * self.head_dim))
-        self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
+        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
+        self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
+        self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
         self.b2 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
         self.use_kernel = use_kernel
@@ -431,6 +432,7 @@ class TTTMLP(TTTBase):
         self.W2 = nn.Parameter(distribute_tensor(self.W2, tp_mesh, [Shard(0)]))
         self.b2 = nn.Parameter(distribute_tensor(self.b2, tp_mesh, [Shard(0)]))
 
+        TritonMLP.sharded_mode = True
         # TkMLP.sharded_mode = True
 
     def ttt(self, inputs):
@@ -446,8 +448,8 @@ class TTTMLP(TTTBase):
         checkpoint_group_size = min(max(self.config.scan_checkpoint_group_size, 1), num_mini_batch)
 
         # if self.use_kernel:
-        if False:
-            XQW_batch = TkMLP.apply(
+        if self.use_kernel:
+            XQW_batch = TritonMLP.apply(
                 self.ttt_norm_weight,
                 self.ttt_norm_bias,
                 W1_states,
@@ -460,7 +462,7 @@ class TTTMLP(TTTBase):
                 inputs["eta"],
                 checkpoint_group_size,
             )
-
+            
             XQW_batch = XQW_batch.permute(0, 2, 3, 1, 4)
         else:
             XQW_batch = ttt_mlp(
