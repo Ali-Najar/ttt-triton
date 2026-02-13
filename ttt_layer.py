@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -9,9 +10,11 @@ from forecast import SequenceMetadata, full_tensor, place_into, shard_tensor, to
 from forecast import ModelConfig
 from linear_triton import TritonLinear
 from mlp_triton import TritonMLP
+from kernels.mlp_cached_readout import mlp_cached_readout_triton
 # from mlp_tk import TkMLP
 from ops import ttt_linear, ttt_mlp
 from utils import apply_rotary_emb, precompute_freqs_cis_3d
+
 
 
 class TTTWrapper(nn.Module):
@@ -76,9 +79,8 @@ class TTTBase(nn.Module):
 
     # We must reinitialize after meta initialization
     def init_weights(self):
-        for linear in (self.wq, self.wk, self.wv):
+        for linear in (self.wq, self.wk, self.wv, self.wo, self.wu):
             nn.init.normal_(linear.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.wo.weight, mean=0.0, std=0.02)
 
         self.post_norm.reset_parameters()
         nn.init.ones_(self.ttt_norm_weight.data)
@@ -91,6 +93,7 @@ class TTTBase(nn.Module):
         self.wk = nn.Linear(self.width, self.num_heads * self.head_dim, bias=True)
         self.wv = nn.Linear(self.width, self.num_heads * self.head_dim, bias=True)
         self.wo = nn.Linear(self.width, self.num_heads * self.head_dim, bias=True)
+        self.wu = nn.Linear(self.width, self.num_heads * self.head_dim, bias=True)
 
     def _init_ttt_lr_gate(self):
         linear_weight_data = nn.Linear(self.width, 1, bias=True).weight.data
@@ -136,13 +139,14 @@ class TTTBase(nn.Module):
         return inputs
 
     @torch.compile
-    def get_qkv_projections(self, hidden_states):
-        XQ, XK, XV = (
-            self.wq(hidden_states),
-            self.wk(hidden_states),
-            self.wv(hidden_states),
-        )
-        return XQ, XK, XV
+    def get_qkvu_projections(self, hidden_states):
+        XQ = self.wq(hidden_states)
+        XK = self.wk(hidden_states)
+        XV = self.wv(hidden_states)
+        XU = self.wu(hidden_states)
+        
+        return XQ, XK, XV, XU
+
 
     @torch.compile
     def get_eta(self, X):
@@ -239,19 +243,20 @@ class TTTBase(nn.Module):
         return XV + XK
 
     @torch.compile
-    def reshape_to_mini_batch(self, X, XQ, XK, XV):
+    def reshape_to_mini_batch(self, X, XQ, XK, XV, XU):
         B, L = X.shape[:2]
         num_mini_batch = L // self.mini_batch_size
 
-        XQ, XK, XV = XQ.transpose(1, 2), XK.transpose(1, 2), XV.transpose(1, 2)
+        XQ, XK, XV, XU = XQ.transpose(1, 2), XK.transpose(1, 2), XV.transpose(1, 2), XU.transpose(1, 2)
 
         X = X.reshape(B, num_mini_batch, self.mini_batch_size, self.width)
 
         XQ = XQ.reshape(B, self.num_heads, num_mini_batch, self.mini_batch_size, self.head_dim)
         XK = XK.reshape(B, self.num_heads, num_mini_batch, self.mini_batch_size, self.head_dim)
         XV = XV.reshape(B, self.num_heads, num_mini_batch, self.mini_batch_size, self.head_dim)
+        XU = XU.reshape(B, self.num_heads, num_mini_batch, self.mini_batch_size, self.head_dim)
 
-        return X, XQ, XK, XV
+        return X, XQ, XK, XV, XU
 
     def process_input(self, hidden_states: torch.Tensor, freqs_cis: torch.Tensor, seq_metadata: SequenceMetadata):
 
@@ -263,32 +268,40 @@ class TTTBase(nn.Module):
         B, L = hidden_states.shape[:2]
         mini_batch_size = self.mini_batch_size
 
-        XQ, XK, XV = self.get_qkv_projections(hidden_states)
+        XQ, XK, XV, XU = self.get_qkvu_projections(hidden_states)
 
         XQ = XQ.view(B, L, -1, self.head_dim)
         XK = XK.view(B, L, -1, self.head_dim)
         XV = XV.view(B, L, -1, self.head_dim)
+        XU = XU.view(B, L, -1, self.head_dim)
 
         # L2 Norm
         XQ = place_into(torch.nn.functional.normalize(to_local(XQ), p=2, dim=-1), XQ)
         XK = place_into(torch.nn.functional.normalize(to_local(XK), p=2, dim=-1), XK)
+        XU = place_into(torch.nn.functional.normalize(to_local(XU), p=2, dim=-1), XU)
 
         XQ_text, XQ_video = XQ[:, :seq_text_length], XQ[:, seq_text_length:]
         XK_text, XK_video = XK[:, :seq_text_length], XK[:, seq_text_length:]
+        XU_text, XU_video = XU[:, :seq_text_length], XU[:, seq_text_length:]
 
         XQ_rope_video, XK_rope_video = apply_rotary_emb(
             to_local(XQ_video), to_local(XK_video), freqs_cis=to_local(freqs_cis)
         )
+        XU_rope_video, _ = apply_rotary_emb(
+            to_local(XU_video), to_local(XU_video), freqs_cis=to_local(freqs_cis)
+        )
 
         XQ_video = place_into(XQ_rope_video, XQ_video)
         XK_video = place_into(XK_rope_video, XK_video)
+        XU_video = place_into(XU_rope_video, XU_video) 
 
         XQ = torch.cat((XQ_text, XQ_video), dim=1)
         XK = torch.cat((XK_text, XK_video), dim=1)
+        XU = torch.cat((XU_text, XU_video), dim=1)  
 
         XV = self.ln_reconstruction_target(XV, XK)
 
-        hidden_states, XQ, XK, XV = self.reshape_to_mini_batch(hidden_states, XQ, XK, XV)
+        hidden_states, XQ, XK, XV, XU = self.reshape_to_mini_batch(hidden_states, XQ, XK, XV, XU)
 
         ttt_lr_eta = self.get_eta(hidden_states)
 
@@ -299,12 +312,14 @@ class TTTBase(nn.Module):
             XQ = place_into(self.interleave(to_local(XQ), seq_metadata), XQ)
             XK = place_into(self.interleave(to_local(XK), seq_metadata), XK)
             XV = place_into(self.interleave(to_local(XV), seq_metadata), XV)
+            XU = place_into(self.interleave(to_local(XU), seq_metadata), XU)
             eta = self.interleave(to_local(eta), seq_metadata)
 
         inputs = {
             "XQ": XQ,
             "XK": XK,
             "XV": XV,
+            "XU": XU,
             "eta": eta,
         }
 
@@ -409,9 +424,9 @@ class TTTLinear(TTTBase):
 class TTTMLP(TTTBase):
     def __init__(self, config: ModelConfig, use_kernel: bool = True):
         super().__init__(config)
-        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
+        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim,  self.head_dim)))
         self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
-        self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
+        self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads,  self.head_dim, self.head_dim)))
         self.b2 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
         self.use_kernel = use_kernel
@@ -446,10 +461,13 @@ class TTTMLP(TTTBase):
         b2_states = torch.tile(self.b2.unsqueeze(0), dims=(B, 1, 1, 1))
 
         checkpoint_group_size = min(max(self.config.scan_checkpoint_group_size, 1), num_mini_batch)
-
+        memo_segment_size = self.config.mem_cache_segment_n_mini_batches
+        
+        W1_memo, b1_memo, W2_memo, b2_memo = None, None, None, None
+        
         # if self.use_kernel:
         if self.use_kernel:
-            XQW_batch = TritonMLP.apply(
+            XQW_batch, W1_memo, b1_memo, W2_memo, b2_memo = TritonMLP.apply(
                 self.ttt_norm_weight,
                 self.ttt_norm_bias,
                 W1_states,
@@ -461,9 +479,11 @@ class TTTMLP(TTTBase):
                 inputs["XK"],
                 inputs["eta"],
                 checkpoint_group_size,
+                memo_segment_size
             )
             
-            XQW_batch = XQW_batch.permute(0, 2, 3, 1, 4)
+            # print(W1_memo.shape)
+        
         else:
             XQW_batch = ttt_mlp(
                 inputs["XK"],
@@ -479,5 +499,63 @@ class TTTMLP(TTTBase):
                 checkpoint_group_size,
             )
 
+        cached_summaries = [] 
+    
+        # # segment loop over NC
+        for i in range (math.ceil(num_mini_batch / memo_segment_size)):
+            s0 = i * memo_segment_size
+            s1 = min((i + 1) * memo_segment_size, num_mini_batch)
+            
+            XQ_seg = inputs["XQ"][:, :, s0:s1].contiguous()
+            XK_seg = inputs["XK"][:, :, s0:s1].contiguous()
+            XU_seg = inputs["XU"][:, :, s0:s1].contiguous()
+            XQW_seg = XQW_batch[:, :, s0:s1].contiguous()
+            
+            # print(XU_seg[0][0][0], s0, s1)
+            summary_cur = XK_seg.mean(dim=(2, 3))          # [B, NH, F] 
+            
+            if(i == 0):
+                cached_summaries.append(summary_cur.detach())
+                continue
+
+            # sims for cached segments: each -> [B, NH, nc_seg, CS]
+            sims = []
+            for summ in cached_summaries:
+                sims.append((XU_seg * summ[:, :, None, None, :]).sum(dim=-1))  # [B,NH,nc,CS]
+
+            sims.append((XU_seg * summary_cur[:, :, None, None, :]).sum(dim=-1))  # current
+            sims = torch.stack(sims, dim=-1)  # [B,NH,nc,CS,M+1]
+            gamma_all = torch.softmax(sims, dim=-1)
+
+            gamma_cache = gamma_all[..., :-1]   # [B,NH,nc,CS,M]
+            gamma_cur   = gamma_all[..., -1:]   # [B,NH,nc,CS,1]
+            
+            # scale online output (matches paper form better)
+            XQW_seg = gamma_cur.to(XQW_seg.dtype) * XQW_seg
+
+            cached_sum = torch.zeros_like(XQW_seg, dtype=torch.float32)
+
+            for j in range(i):
+                with torch.no_grad():
+                    cached_delta_i = mlp_cached_readout_triton(
+                        XQ_seg,
+                        W1_memo[:, :, j],  # W1
+                        b1_memo[:, :, j],  # b1
+                        W2_memo[:, :, j],  # W2
+                        b2_memo[:, :, j],  # b2
+                        self.ttt_norm_weight,
+                        self.ttt_norm_bias,
+                    ).to(torch.float32)
+
+                w = gamma_cache[..., j:j+1].to(torch.float32)  # grad flows into w
+                cached_sum = cached_sum + w * cached_delta_i
+
+            # add to output; gradient flows into gamma (thus W_u), not into cached_delta_i/states
+            XQW_seg = XQW_seg + cached_sum.to(XQW_seg.dtype)
+            
+            XQW_batch[:, :, s0:s1] = XQW_seg 
+            cached_summaries.append(summary_cur.detach())
+        
+        XQW_batch = XQW_batch.permute(0, 2, 3, 1, 4)
         XQW_batch = XQW_batch.reshape(B, L, self.width)
         return XQW_batch

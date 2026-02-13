@@ -24,6 +24,10 @@ def ttt_mlp_scan_forward(
     b1_checkpoints_ptr,
     W2_checkpoints_ptr,
     b2_checkpoints_ptr,
+    W1_memo_ptr,
+    b1_memo_ptr,
+    W2_memo_ptr,
+    b2_memo_ptr,
     # Strides
     CS_F_stride: tl.constexpr,
     CS_FF_stride: tl.constexpr,
@@ -40,6 +44,8 @@ def ttt_mlp_scan_forward(
     FF: tl.constexpr,
     K: tl.constexpr,
     checkpoint_group_size: tl.constexpr,
+    NS: tl.constexpr,
+    memo_segment_size: tl.constexpr,
 ):
     # print("hi")
     batch = tl.program_id(0)
@@ -51,6 +57,12 @@ def ttt_mlp_scan_forward(
     K_FF_stride = K * FF_stride
     K_FF_F_stride = K * FF_F_stride
     K_F_stride = K * F_stride
+    
+    # base strides for memory caching
+    NS_F_FF_stride = NS * F_FF_stride
+    NS_FF_stride = NS * FF_stride
+    NS_FF_F_stride = NS * FF_F_stride
+    NS_F_stride = NS * F_stride
 
     # Offsets for current states
     W1_off = batch * NH * F_FF_stride + head * F_FF_stride + tl.arange(0, F)[:, None] * FF + tl.arange(0, FF)[None, :]
@@ -177,6 +189,41 @@ def ttt_mlp_scan_forward(
 
         XQW = XQ + Z2b_ln
         tl.store(XQW_batch_ptr + CS_F_off, XQW)
+        
+        if i % memo_segment_size == 0:
+            curr_ns = i // memo_segment_size
+            
+            W1_memo_off = (
+                batch * NH * NS_F_FF_stride
+                + head * NS_F_FF_stride
+                + curr_ns * F_FF_stride
+                + tl.arange(0, F)[:, None] * FF
+                + tl.arange(0, FF)[None, :]
+            )
+            b1_memo_off = (
+                batch * NH * NS_FF_stride
+                + head * NS_FF_stride
+                + curr_ns * FF_stride
+                + tl.arange(0, FF)[None, :]
+            )
+            W2_memo_off = (
+                batch * NH * NS_FF_F_stride
+                + head * NS_FF_F_stride
+                + curr_ns * FF_F_stride
+                + tl.arange(0, FF)[:, None] * F
+                + tl.arange(0, F)[None, :]
+            )
+            b2_memo_off = (
+                batch * NH * NS_F_stride
+                + head * NS_F_stride
+                + curr_ns * F_stride
+                + tl.arange(0, F)[None, :]
+            )
+
+            tl.store(W1_memo_ptr + W1_memo_off, W1)
+            tl.store(b1_memo_ptr + b1_memo_off, b1)
+            tl.store(W2_memo_ptr + W2_memo_off, W2)
+            tl.store(b2_memo_ptr + b2_memo_off, b2)
 
     # store final states
     W1_last_off = W1_off

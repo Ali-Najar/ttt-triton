@@ -26,6 +26,7 @@ class TritonMLP(torch.autograd.Function):
         XK_batch,
         eta_batch,
         checkpoint_group_size,
+        memo_segment_size,
     ) -> torch.Tensor:
         if TritonMLP.sharded_mode:
             return TritonMLP.forward_sharded(
@@ -41,6 +42,7 @@ class TritonMLP(torch.autograd.Function):
                 XK_batch,
                 eta_batch,
                 checkpoint_group_size,
+                memo_segment_size,
             )
         else:
             return TritonMLP.forward_unsharded(
@@ -56,10 +58,11 @@ class TritonMLP(torch.autograd.Function):
                 XK_batch,
                 eta_batch,
                 checkpoint_group_size,
+                memo_segment_size,
             )
 
     @staticmethod
-    def backward(ctx, grad_L_XQW_batch):
+    def backward(ctx, grad_L_XQW_batch, *unused):
         if TritonMLP.sharded_mode:
             return TritonMLP.backward_sharded(ctx, grad_L_XQW_batch)
         else:
@@ -79,6 +82,7 @@ class TritonMLP(torch.autograd.Function):
         XK_batch,
         eta_batch,
         checkpoint_group_size,
+        memo_segment_size
     ):
         B, NH, NC, CS, F = XQ_batch.shape
         FF = W1_init.shape[-1]  # 4*F for MLP
@@ -90,7 +94,8 @@ class TritonMLP(torch.autograd.Function):
         assert b2_init.shape[-1] == F
 
         K = math.ceil(NC / checkpoint_group_size)
-
+        NS = math.ceil(NC / memo_segment_size)
+        
         device = XQ_batch.device
         mp_dtype = XQ_batch.dtype
 
@@ -106,6 +111,12 @@ class TritonMLP(torch.autograd.Function):
         b1_checkpoints = torch.empty(B, NH, K, 1, FF, device=device, dtype=torch.float32)
         W2_checkpoints = torch.empty(B, NH, K, FF, F, device=device, dtype=torch.float32)
         b2_checkpoints = torch.empty(B, NH, K, 1, F, device=device, dtype=torch.float32)
+        
+        # Memo_caching
+        W1_memo = torch.empty(B, NH, NS, F, FF, device=device, dtype=torch.float32)
+        b1_memo = torch.empty(B, NH, NS, 1, FF, device=device, dtype=torch.float32)
+        W2_memo = torch.empty(B, NH, NS, FF, F, device=device, dtype=torch.float32)
+        b2_memo = torch.empty(B, NH, NS, 1, F, device=device, dtype=torch.float32)
 
         # Strides
         CS_F_stride = CS * F
@@ -141,6 +152,11 @@ class TritonMLP(torch.autograd.Function):
             b1_checkpoints.contiguous(),
             W2_checkpoints.contiguous(),
             b2_checkpoints.contiguous(),
+            # Memo_caching
+            W1_memo.contiguous(),
+            b1_memo.contiguous(),
+            W2_memo.contiguous(),
+            b2_memo.contiguous(),
             # Strides
             CS_F_stride,
             CS_FF_stride,
@@ -157,6 +173,8 @@ class TritonMLP(torch.autograd.Function):
             FF,
             K,
             checkpoint_group_size,
+            NS,
+            memo_segment_size,
         )
 
         checkpoint_shapes = torch.tensor([K, checkpoint_group_size])
@@ -174,8 +192,9 @@ class TritonMLP(torch.autograd.Function):
             b2_checkpoints,
             checkpoint_shapes,
         )
-
-        return XQW_batch.to(mp_dtype)
+        
+        ctx.mark_non_differentiable(W1_memo, b1_memo, W2_memo, b2_memo)
+        return XQW_batch.to(mp_dtype), W1_memo, b1_memo, W2_memo, b2_memo
 
     @staticmethod
     def _backward_core(ctx, grad_L_XQW_batch):
@@ -347,7 +366,14 @@ class TritonMLP(torch.autograd.Function):
             [Shard(1)],
             None,
         ),
-        out_placements=([Shard(1)],),
+        out_placements=(
+            [Shard(1)],  # XQW
+            [Shard(1)],  # W1_last
+            [Shard(1)],  # b1_last
+            [Shard(1)],  # W2_last
+            [Shard(1)],  # b2_last
+        ),
+
     )
     def forward_sharded(
         ctx,
@@ -362,6 +388,7 @@ class TritonMLP(torch.autograd.Function):
         XK_batch,
         eta_batch,
         checkpoint_group_size,
+        memo_segment_size,
     ):
         return TritonMLP._forward_core(
             ctx,
@@ -376,6 +403,7 @@ class TritonMLP(torch.autograd.Function):
             XK_batch,
             eta_batch,
             checkpoint_group_size,
+            memo_segment_size,
         )
 
     @staticmethod
@@ -393,6 +421,7 @@ class TritonMLP(torch.autograd.Function):
         XK_batch,
         eta_batch,
         checkpoint_group_size,
+        memo_segment_size,
     ):
         return TritonMLP._forward_core(
             ctx,
@@ -407,12 +436,13 @@ class TritonMLP(torch.autograd.Function):
             XK_batch,
             eta_batch,
             checkpoint_group_size,
+            memo_segment_size,
         )
 
     @staticmethod
     @partial(
         local_map,
-        in_placements=(None, [Shard(1)]),
+        in_placements=(None, [Shard(1)], None, None, None, None),
         out_placements=(
             [Shard(0)],
             [Shard(0)],
@@ -428,7 +458,7 @@ class TritonMLP(torch.autograd.Function):
             None,
         ),
     )
-    def backward_sharded(ctx, grad_L_XQW_batch):
+    def backward_sharded(ctx, grad_L_XQW_batch, *unused_grads):
         return TritonMLP._backward_core(ctx, grad_L_XQW_batch)
 
     @staticmethod
