@@ -43,6 +43,9 @@ class ModelConfig:
     # TTT-Specific Configs
     mini_batch_size: int = 64
     ttt_base_lr: float = 0.1
+    
+    mem_cache_segment_n_mini_batches: int = 2
+    mem_cache_max_segments: int = 4
 
     rope_theta: float = 10000.0
     scan_checkpoint_group_size: int = 16
