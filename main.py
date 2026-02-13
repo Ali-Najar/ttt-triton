@@ -54,7 +54,7 @@ def main():
         model_dim=128,
         num_heads=4,
         num_layers=1,
-        ssm_layer="ttt_linear",        # or "ttt_mlp"
+        ssm_layer="ttt_mlp",        # or "ttt_mlp"
         mini_batch_size=64,            # must divide seq_len
         ttt_base_lr=0.05,
         scan_checkpoint_group_size=16,
@@ -99,7 +99,7 @@ def main():
 
         return total / max(n, 1)
 
-    for epoch in range(5):
+    for epoch in range(20):
         train_loss = run_epoch(train_loader, train=True)
         val_loss = run_epoch(val_loader, train=False)
         print(f"epoch {epoch:02d} | train {train_loss:.6f} | val {val_loss:.6f}")
