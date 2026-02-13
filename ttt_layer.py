@@ -520,8 +520,7 @@ class TTTMLP(TTTBase):
                 gamma_cur   = gamma_all[..., -1:]   # [B,NH,nc,CS,1]
 
                 # scale online output (matches paper form better)
-                delta_cur = XQW_seg - XQ_seg                  # [B,NH,nc,CS,F]
-                XQW_seg = XQ_seg + gamma_cur.to(XQW_seg.dtype) * delta_cur
+                XQW_seg = gamma_cur.to(XQW_seg.dtype) * XQW_seg
 
             cached_sum = torch.zeros_like(XQW_seg, dtype=torch.float32)
 
