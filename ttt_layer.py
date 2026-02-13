@@ -452,13 +452,17 @@ class TTTMLP(TTTBase):
 
     def ttt(self, inputs):
         B = inputs["XV"].shape[0]
+        NH = inputs["XV"].shape[1]
         num_mini_batch = inputs["XV"].shape[2]
-        L = inputs["XV"].shape[2] * inputs["XV"].shape[3]
+        CS = inputs["XV"].shape[3]
+        F = inputs["XV"].shape[4]
+        L = num_mini_batch * CS
 
-        W1_states = torch.tile(self.W1.unsqueeze(0), dims=(B, 1, 1, 1))
-        b1_states = torch.tile(self.b1.unsqueeze(0), dims=(B, 1, 1, 1))
-        W2_states = torch.tile(self.W2.unsqueeze(0), dims=(B, 1, 1, 1))
-        b2_states = torch.tile(self.b2.unsqueeze(0), dims=(B, 1, 1, 1))
+        # init online states
+        W1_state = torch.tile(self.W1.unsqueeze(0), dims=(B, 1, 1, 1))
+        b1_state = torch.tile(self.b1.unsqueeze(0), dims=(B, 1, 1, 1))
+        W2_state = torch.tile(self.W2.unsqueeze(0), dims=(B, 1, 1, 1))
+        b2_state = torch.tile(self.b2.unsqueeze(0), dims=(B, 1, 1, 1))
 
         checkpoint_group_size = min(max(self.config.scan_checkpoint_group_size, 1), num_mini_batch)
         memo_segment_size = self.config.mem_cache_segment_n_mini_batches
@@ -470,10 +474,10 @@ class TTTMLP(TTTBase):
             XQW_batch, W1_memo, b1_memo, W2_memo, b2_memo = TritonMLP.apply(
                 self.ttt_norm_weight,
                 self.ttt_norm_bias,
-                W1_states,
-                b1_states,
-                W2_states,
-                b2_states,
+                W1_state,
+                b1_state,
+                W2_state,
+                b2_state,
                 inputs["XQ"],
                 inputs["XV"],
                 inputs["XK"],
@@ -492,10 +496,10 @@ class TTTMLP(TTTBase):
                 inputs["eta"],
                 self.ttt_norm_weight,
                 self.ttt_norm_bias,
-                W1_states,
-                b1_states,
-                W2_states,
-                b2_states,
+                W1_state,
+                b1_state,
+                W2_state,
+                b2_state,
                 checkpoint_group_size,
             )
 
