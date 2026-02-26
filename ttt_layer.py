@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -423,6 +424,7 @@ class TTTLinear(TTTBase):
 class TTTMLP(TTTBase):
     def __init__(self, config: ModelConfig, use_kernel: bool = True):
         super().__init__(config)
+        print(self.config.mem_cache_topk)
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim,  self.head_dim)))
         self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
         self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads,  self.head_dim, self.head_dim)))
@@ -451,110 +453,131 @@ class TTTMLP(TTTBase):
 
     def ttt(self, inputs):
         B = inputs["XV"].shape[0]
-        NH = inputs["XV"].shape[1]
         num_mini_batch = inputs["XV"].shape[2]
-        CS = inputs["XV"].shape[3]
-        F = inputs["XV"].shape[4]
-        L = num_mini_batch * CS
+        L = inputs["XV"].shape[2] * inputs["XV"].shape[3]
 
-        # init online states
-        W1_state = torch.tile(self.W1.unsqueeze(0), dims=(B, 1, 1, 1))
-        b1_state = torch.tile(self.b1.unsqueeze(0), dims=(B, 1, 1, 1))
-        W2_state = torch.tile(self.W2.unsqueeze(0), dims=(B, 1, 1, 1))
-        b2_state = torch.tile(self.b2.unsqueeze(0), dims=(B, 1, 1, 1))
+        W1_states = torch.tile(self.W1.unsqueeze(0), dims=(B, 1, 1, 1))
+        b1_states = torch.tile(self.b1.unsqueeze(0), dims=(B, 1, 1, 1))
+        W2_states = torch.tile(self.W2.unsqueeze(0), dims=(B, 1, 1, 1))
+        b2_states = torch.tile(self.b2.unsqueeze(0), dims=(B, 1, 1, 1))
 
-        # ---- caching knobs (add to config later if you want) ----
-        seg_nc = getattr(self.config, "mem_cache_segment_n_mini_batches", 8)   # segment length in mini-batches
-        max_cache = getattr(self.config, "mem_cache_max_segments", 4)
+        checkpoint_group_size = min(max(self.config.scan_checkpoint_group_size, 1), num_mini_batch)
+        memo_segment_size = self.config.mem_cache_segment_n_mini_batches
+        
+        W1_memo, b1_memo, W2_memo, b2_memo = None, None, None, None
+        
+        # if self.use_kernel:
+        if self.use_kernel:
+            XQW_batch, W1_memo, b1_memo, W2_memo, b2_memo = TritonMLP.apply(
+                self.ttt_norm_weight,
+                self.ttt_norm_bias,
+                W1_states,
+                b1_states,
+                W2_states,
+                b2_states,
+                inputs["XQ"],
+                inputs["XV"],
+                inputs["XK"],
+                inputs["eta"],
+                checkpoint_group_size,
+                memo_segment_size
+            )
+            
+            # print(W1_memo.shape)
+        
+        else:
+            XQW_batch = ttt_mlp(
+                inputs["XK"],
+                inputs["XQ"],
+                inputs["XV"],
+                inputs["eta"],
+                self.ttt_norm_weight,
+                self.ttt_norm_bias,
+                W1_states,
+                b1_states,
+                W2_states,
+                b2_states,
+                checkpoint_group_size,
+            )
 
-        cached_states = []   # list of (W1,b1,W2,b2) detached
-        cached_summaries = []
-        outputs = []
-
-        # segment loop over NC
-        for s0 in range(0, num_mini_batch, seg_nc):
-            s1 = min(s0 + seg_nc, num_mini_batch)
-            nc_seg = s1 - s0
-
+        cached_summaries = [] 
+    
+        # # segment loop over NC
+        for i in range (math.ceil(num_mini_batch / memo_segment_size)):
+            s0 = i * memo_segment_size
+            s1 = min((i + 1) * memo_segment_size, num_mini_batch)
+            
             XQ_seg = inputs["XQ"][:, :, s0:s1].contiguous()
-            XV_seg = inputs["XV"][:, :, s0:s1].contiguous()
             XK_seg = inputs["XK"][:, :, s0:s1].contiguous()
             XU_seg = inputs["XU"][:, :, s0:s1].contiguous()
-            eta_seg = inputs["eta"][:, :, s0:s1].contiguous()
+            XQW_seg = XQW_batch[:, :, s0:s1].contiguous()
             
             # print(XU_seg[0][0][0], s0, s1)
+            summary_cur = XK_seg.mean(dim=(2, 3))          # [B, NH, F] 
             
-            summary_cur = XU_seg.mean(dim=(2, 3))          # [B, NH, F] 
+            if(i == 0):
+                cached_summaries.append(summary_cur.detach())
+                continue
 
-            checkpoint_group_size = min(max(self.config.scan_checkpoint_group_size, 1), nc_seg)
+            # sims for cached segments: each -> [B, NH, nc_seg, CS]
+            sims = []
+            for summ in cached_summaries:
+                sims.append((XU_seg * summ[:, :, None, None, :]).sum(dim=-1))  # [B,NH,nc,CS]
 
-            if self.use_kernel:
-                # online path (differentiable)
-                XQW_seg, W1_last, b1_last, W2_last, b2_last = TritonMLP.apply(
-                    self.ttt_norm_weight,
-                    self.ttt_norm_bias,
-                    W1_state,
-                    b1_state,
-                    W2_state,
-                    b2_state,
-                    XQ_seg,
-                    XV_seg,
-                    XK_seg,
-                    eta_seg,
-                    checkpoint_group_size,
-                )
-            else:
-                raise RuntimeError("Use kernel mode for cached memory path")
+            sims.append((XU_seg * summary_cur[:, :, None, None, :]).sum(dim=-1))  # current
+            sims = torch.stack(sims, dim=-1)  # [B,NH,nc,CS,M+1]
+            gamma_all = torch.softmax(sims, dim=-1)
 
-            if len(cached_states) > 0:
-                # sims for cached segments: each -> [B, NH, nc_seg, CS]
-                sims = []
-                for summ in cached_summaries:
-                    sims.append((XU_seg * summ[:, :, None, None, :]).sum(dim=-1))  # [B,NH,nc,CS]
+            gamma_cache = gamma_all[..., :-1]   # [B,NH,nc,CS,M]
+            gamma_cur   = gamma_all[..., -1:]   # [B,NH,nc,CS,1]
+            
+            # scale online output (matches paper form better)
+            XQW_seg = gamma_cur.to(XQW_seg.dtype) * XQW_seg
 
-                sims.append((XU_seg * summary_cur[:, :, None, None, :]).sum(dim=-1))  # current
-                sims = torch.stack(sims, dim=-1)  # [B,NH,nc,CS,M+1]
-                gamma_all = torch.softmax(sims, dim=-1)
-
-                gamma_cache = gamma_all[..., :-1]   # [B,NH,nc,CS,M]
-                gamma_cur   = gamma_all[..., -1:]   # [B,NH,nc,CS,1]
-
-                # scale online output (matches paper form better)
-                XQW_seg = gamma_cur.to(XQW_seg.dtype) * XQW_seg
-
-            cached_sum = torch.zeros_like(XQW_seg, dtype=torch.float32)
-
-            for i in range(len(cached_states)):
+            top_k = self.config.mem_cache_topk
+            
+            if i > 0:
                 with torch.no_grad():
-                    cached_delta_i = mlp_cached_readout_triton(
+                    # Batch process all i past segments in parallel!
+                    all_cached_deltas = mlp_cached_readout_triton(
                         XQ_seg,
-                        cached_states[i][0],  # W1
-                        cached_states[i][1],  # b1
-                        cached_states[i][2],  # W2
-                        cached_states[i][3],  # b2
+                        W1_memo[:, :, :i].contiguous(), 
+                        b1_memo[:, :, :i].contiguous(), 
+                        W2_memo[:, :, :i].contiguous(), 
+                        b2_memo[:, :, :i].contiguous(), 
                         self.ttt_norm_weight,
                         self.ttt_norm_bias,
-                    ).to(torch.float32)
+                    ).to(torch.float32) # Shape: [B, NH, NCseg, i, CS, F]
+                
+                # Permute to map the segment axis to match gamma_cache
+                # new shape: [B, NH, NCseg, CS, i, F]
+                all_cached_deltas = all_cached_deltas.permute(0, 1, 2, 4, 3, 5)
+                
+                K = min(top_k, i)
+                if K < i:
+                    # Sparse Selective Caching Router
+                    topk_weights, topk_indices = torch.topk(gamma_cache, k=K, dim=-1) # [B, NH, nc, CS, K]
+                    
+                    # Expand indices to match the feature dimension F
+                    gather_indices = topk_indices.unsqueeze(-1).expand(-1, -1, -1, -1, -1, XQ_seg.shape[-1])
+                    
+                    # Gather the Top-K memory readouts
+                    topk_deltas = torch.gather(all_cached_deltas, dim=4, index=gather_indices) # [B, NH, nc, CS, K, F]
+                    
+                    # Weighted sum of the chosen blocks
+                    cached_sum = (topk_deltas * topk_weights.unsqueeze(-1).to(torch.float32)).sum(dim=4)
+                else:
+                    # Standard execution if i <= top_k
+                    cached_sum = (all_cached_deltas * gamma_cache.unsqueeze(-1).to(torch.float32)).sum(dim=4)
+            else:
+                cached_sum = torch.zeros_like(XQW_seg, dtype=torch.float32)
 
-                w = gamma_cache[..., i:i+1].to(torch.float32)  # grad flows into w
-                # print("w:", w)
-                cached_sum = cached_sum + w * cached_delta_i
-
-            # add to output; gradient flows into gamma (thus W_u), not into cached_delta_i/states
+            # add to output
             XQW_seg = XQW_seg + cached_sum.to(XQW_seg.dtype)
-
-            outputs.append(XQW_seg)
-
-            # advance online state to next segment
-            W1_state, b1_state, W2_state, b2_state = W1_last, b1_last, W2_last, b2_last
-
-            # push current segment final state into cache (DETACHED)
-            cached_states.append((W1_last.detach(), b1_last.detach(), W2_last.detach(), b2_last.detach()))
+            
+            XQW_batch[:, :, s0:s1] = XQW_seg 
             cached_summaries.append(summary_cur.detach())
-            if len(cached_states) > max_cache:
-                cached_states.pop(0)
-                cached_summaries.pop(0)
-
-        XQW_batch = torch.cat(outputs, dim=2)  # [B,NH,NC,CS,F]
+        
+        XQW_batch = XQW_batch.permute(0, 2, 3, 1, 4)
         XQW_batch = XQW_batch.reshape(B, L, self.width)
         return XQW_batch

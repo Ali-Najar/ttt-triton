@@ -46,6 +46,7 @@ class ModelConfig:
     
     mem_cache_segment_n_mini_batches: int = 2
     mem_cache_max_segments: int = 4
+    mem_cache_topk: int = 0
 
     rope_theta: float = 10000.0
     scan_checkpoint_group_size: int = 16

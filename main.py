@@ -99,7 +99,7 @@ def main():
 
         return total / max(n, 1)
 
-    for epoch in range(20):
+    for epoch in range(100):
         train_loss = run_epoch(train_loader, train=True)
         val_loss = run_epoch(val_loader, train=False)
         print(f"epoch {epoch:02d} | train {train_loss:.6f} | val {val_loss:.6f}")
